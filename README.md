@@ -79,65 +79,7 @@ _No response_
 
 Rewrite the [`_afterTokenTransfer`](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/LenderCommitmentForwarder/extensions/LenderCommitmentGroup/LenderCommitmentGroupShares.sol#L60) hook to be skipped in case of `amount = 0` 
 
-# Issue H-2: Attacker can revoke any user from a market 
-
-Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/37 
-
-## Found by 
-PeterSR, hash
-### Summary
-
-Lack of access control in `revokeLender` allows an attacker to revoke any participant from a market
-
-### Root Cause
-
-The [delegation version](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/MarketRegistry.sol#L332-L338) of the `revokeLender` function fails to perform any access control checks allowing any user to revoke any user
-
-```solidity
-    function _revokeStakeholderViaDelegation(
-        uint256 _marketId,
-        address _stakeholderAddress,
-        bool _isLender,
-        uint8 _v,
-        bytes32 _r,
-        bytes32 _s
-    ) internal {
-        bytes32 uuid = _revokeStakeholderVerification(
-            _marketId,
-            _stakeholderAddress,
-            _isLender
-        );
-        // NOTE: Disabling the call to revoke the attestation on EAS contracts
-        //        address attestor = markets[_marketId].owner;
-        //        tellerAS.revokeByDelegation(uuid, attestor, _v, _r, _s);
-    }
-```
-
-### Internal pre-conditions
-
-Attestation should be enabled to observe the impact
-
-### External pre-conditions
-
-_No response_
-
-### Attack Path
-
-1. Attacker calls `revokeLender` by passing in any address they wish to revoke from the market
-
-### Impact
-
-Attacker can revoke any address they wish from any market making the market unuseable
-
-### PoC
-
-_No response_
-
-### Mitigation
-
-Perform access control checks
-
-# Issue H-3: Malicious lender can prevent borrower from repayment due to try/catch block revert 
+# Issue H-2: Malicious lender can prevent borrower from repayment due to try/catch block revert 
 
 Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/39 
 
@@ -215,49 +157,59 @@ _No response_
 
 Use .call instead of the try/catch
 
-# Issue M-1: Incorrect Price Calculation for Negative Ticks Due to Missing Rounding Down 
+# Issue H-3: Using original principal amount as due amount inside `liquidateDefaultedLoanWithIncentive` breaks contract accounting leading to lost assets/broken functionalities 
 
-Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/20 
+Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/43 
 
 ## Found by 
-Naresh
+0xeix, hash
 ### Summary
 
-The function `getSqrtTwapX96` is used to calculate the Time-Weighted Average Price (TWAP) for a given Uniswap V3 pool. It fetches the cumulative tick values over a specified interval and calculates the square root price in X96 format. However, the function does not handle negative tick differences correctly, leading to potential inaccuracies in the TWAP calculation.
-
-In cases where `(tickCumulatives[1] - tickCumulatives[0])` is negative and `(tickCumulatives[1] - tickCumulatives[0]) % twapInterval != 0`, the tick should be rounded down to account for fractional remainders. The current implementation directly performs integer division, which implicitly rounds towards zero, leading to an incorrectly higher tick value and therefore inaccurate price calculations.
+Using original principal amount as due amount inside `liquidateDefaultedLoanWithIncentive` breaks contract accounting leading to lost assets/broken functionalities
 
 ### Root Cause
 
-The implementation of [getSqrtTwapX96](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/libraries/UniswapPricingLibrary.sol#L107-L120) does not apply rounding towards negative infinity for the tick calculation when `(tickCumulatives[1] - tickCumulatives[0])` is negative.
+In `liquidateDefaultedLoanWithIncentive`, the amount due is taken as the [original principal amount](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/LenderCommitmentForwarder/extensions/LenderCommitmentGroup/LenderCommitmentGroup_Smart.sol#L657-L664) of the bid rather than the remaining to be repaid principal which is incorrect as part of this principal could [have already been paid back](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/LenderCommitmentForwarder/extensions/LenderCommitmentGroup/LenderCommitmentGroup_Smart.sol#L928-L935)
+
 ```solidity
-   uint32[] memory secondsAgos = new uint32[](2);
-   secondsAgos[0] = twapInterval + 1; // from (before)
-   secondsAgos[1] = 1; // one block prior
+    function liquidateDefaultedLoanWithIncentive(
+        uint256 _bidId,
+        int256 _tokenAmountDifference
+    ) external whenForwarderNotPaused whenNotPaused bidIsActiveForGroup(_bidId) nonReentrant onlyOracleApprovedAllowEOA {
+        
+        //use original principal amount as amountDue
 
-   (int56[] memory tickCumulatives, ) = IUniswapV3Pool(uniswapV3Pool)
-                .observe(secondsAgos);
-
-    // tick(imprecise as it's an integer) to price
-    sqrtPriceX96 = TickMath.getSqrtRatioAtTick(
-            int24(
-                  (tickCumulatives[1] - tickCumulatives[0]) /
-                      int32(twapInterval)
-                )
-            );         
-``` 
-As result, in case if `(tickCumulatives[1] - tickCumulatives[0])` is negative and `(tickCumulatives[1] - tickCumulatives[0]) % twapInterval != 0`, then returned tick will be bigger then it should be, hence incorrect prices would be used.
-
-In contrast, the [Uniswap OracleLibrary](https://github.com/Uniswap/v3-periphery/blob/697c2474757ea89fec12a4e6db16a574fe259610/contracts/libraries/OracleLibrary.sol#L16-L41) includes a safeguard for such cases by explicitly decrementing the tick when necessary.
-```solidity
-        int56 tickCumulativesDelta = tickCumulatives[1] - tickCumulatives[0];
-        uint160 secondsPerLiquidityCumulativesDelta =
-            secondsPerLiquidityCumulativeX128s[1] - secondsPerLiquidityCumulativeX128s[0];
-
-        arithmeticMeanTick = int24(tickCumulativesDelta / secondsAgo);
-        // Always round to negative infinity
-@>      if (tickCumulativesDelta < 0 && (tickCumulativesDelta % secondsAgo != 0)) arithmeticMeanTick--;
+        uint256 amountDue = _getAmountOwedForBid(_bidId);
 ```
+
+```solidity
+    function _getAmountOwedForBid(uint256 _bidId )
+        internal
+        view
+        virtual
+        returns (uint256 amountDue)
+    {
+        // @audit this is the entire principal amount which is incorrect
+        (,,,, amountDue, , ,  )
+         = ITellerV2(TELLER_V2).getLoanSummary(_bidId);  
+    }
+```
+
+Parts of the original principal could have been repaid and accounted via this function leading to double counting of principal in `totalPrincipalTokensRepaid`
+```solidity
+    function repayLoanCallback(
+        uint256 _bidId,
+        address repayer,
+        uint256 principalAmount,
+        uint256 interestAmount
+    ) external onlyTellerV2 whenForwarderNotPaused whenNotPaused bidIsActiveForGroup(_bidId) { 
+        totalPrincipalTokensRepaid += principalAmount;
+        totalInterestCollected += interestAmount;
+```
+
+This leads to several problems:
+1. Underflow in `totalPrincipalTokensLended - totalPrincipalTokensRepaid` as `totalPrincipalTokensRepaid` can double count repaid tokens causing bids to revert  
+2. Lost assets due to `tokenDifferenceFromLiquidations` calculating difference from `totalPrincipal` without considering the repaid assets
 
 ### Internal pre-conditions
 
@@ -269,11 +221,42 @@ _No response_
 
 ### Attack Path
 
-_No response_
+1. A loan is created with principal amount == 100
+tokenBalanceOfContract == 0
+
+totalPrincipalTokensCommitted == 100
+totalPrincipalTokensWithdrawn == 0
+totalPrincipalTokensLended == 100
+totalPrincipalTokensRepaid == 0
+tokenDifferenceFromLiquidations == 0
+
+2. Repayment of 80 principal occurs before the loan gets defaulted
+tokenBalanceOfContract == 80
+
+totalPrincipalTokensCommitted == 100
+totalPrincipalTokensWithdrawn == 0
+totalPrincipalTokensLended == 100
+totalPrincipalTokensRepaid == 80
+tokenDifferenceFromLiquidations == 0
+
+3. Loan defaults and auction settles at price 50 (similarly problematic paths are lenders withdrawing 80 first or the auction settling at higher prices)
+tokenBalanceOfContract == 80 + 50 == 130
+
+totalPrincipalTokensCommitted == 100
+totalPrincipalTokensWithdrawn == 0
+totalPrincipalTokensLended == 100
+totalPrincipalTokensRepaid == 80 + 100 == 180 => incorrect
+tokenDifferenceFromLiquidations == (100 - 50 == -50) => incorrect
+
+Now: 
+- available amount to withdraw will be calculated as (totalPrincipalTokensCommitted + tokenDifferenceFromLiquidations == 50) while there is actually 130 amount of assets available to withdraw causing loss for lenders
+- getPrincipalAmountAvailableToBorrow will underflow because (totalPrincipalTokensLended - totalPrincipalTokensRepaid == -80) and no new bids can be accepted
+
+There are more scenarios that arise from the same root cause such as estimated value becoming 0 incorrectly, which will cause division by 0 and hence revert on withdrawals, deposits will be lost or 0 shares will be minted etc. 
 
 ### Impact
 
-The TWAP derived from the function will be inaccurate when the cumulative tick difference is negative and not evenly divisible by the interval. In such cases, the tick is effectively rounded up instead of down, causing the returned price to be higher than the actual value.
+Lost assets for users, broken functionalities
 
 ### PoC
 
@@ -281,47 +264,9 @@ _No response_
 
 ### Mitigation
 
-Similar to Uniswap, add the following check before using tick to calculate sqrtPriceX96.
-```diff
-  function getSqrtTwapX96(address uniswapV3Pool, uint32 twapInterval)
-        internal
-        view
-        returns (uint160 sqrtPriceX96)
-    {
-        if (twapInterval == 0) {
-            // return the current price if twapInterval == 0
-            (sqrtPriceX96, , , , , , ) = IUniswapV3Pool(uniswapV3Pool).slot0();
-        } else {
-          uint32[] memory secondsAgo = new uint32[](2);
-          secondsAgo[0] = _interval; // from (before)
-          secondsAgo[1] = 0; // to (now)
+Instead of the totalPrincipal consider the remaining principal ie. `totalPrincipal - repaidPrincipal`
 
-          (int56[] memory tickCumulatives, ) = IUniswapV3Pool(_uniswapV3Pool)
-              .observe(secondsAgo);
-
-        
-+        int56 tickCumulativeDelta = tickCumulatives[1] - tickCumulatives[0];
-
-+        int24 tick = int24(tickCumulativeDelta / int56(int32(twapInterval)));
-
-         // Apply rounding towards negative infinity when necessary
-+        if (tickCumulativeDelta < 0 && (tickCumulativeDelta % int32(twapInterval) != 0)) tick--;
-       
-+        sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
-
--        sqrtPriceX96 = TickMath.getSqrtRatioAtTick(
--              int24(
--                  (tickCumulatives[1] - tickCumulatives[0]) /
--                      int32(twapInterval)
--              )
--        );
-
-        }
-
-   }
-```
-
-# Issue M-2: ERC20.approve Used Instead of Safe Approvals, Causing Pool Failures with Some ERC20s 
+# Issue M-1: ERC20.approve Used Instead of Safe Approvals, Causing Pool Failures with Some ERC20s 
 
 Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/29 
 
@@ -455,7 +400,7 @@ require(
 principalToken.safeApprove(address(TELLER_V2), _principalAmount);
 ```
 
-# Issue M-3: Users can lower the interest rate by dividing a loan into multiple smaller loans 
+# Issue M-2: Users can lower the interest rate by dividing a loan into multiple smaller loans 
 
 Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/34 
 
@@ -556,63 +501,43 @@ Middle value should be used instead of end value.
     }
 ```
 
-# Issue M-4: Using original principal amount as due amount inside `liquidateDefaultedLoanWithIncentive` breaks contract accounting leading to lost assets/broken functionalities 
+# Issue M-3: Attacker can revoke any user from a market 
 
-Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/43 
+Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/37 
 
 ## Found by 
-0xeix, hash
+PeterSR, hash
 ### Summary
 
-Using original principal amount as due amount inside `liquidateDefaultedLoanWithIncentive` breaks contract accounting leading to lost assets/broken functionalities
+Lack of access control in `revokeLender` allows an attacker to revoke any participant from a market
 
 ### Root Cause
 
-In `liquidateDefaultedLoanWithIncentive`, the amount due is taken as the [original principal amount](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/LenderCommitmentForwarder/extensions/LenderCommitmentGroup/LenderCommitmentGroup_Smart.sol#L657-L664) of the bid rather than the remaining to be repaid principal which is incorrect as part of this principal could [have already been paid back](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/LenderCommitmentForwarder/extensions/LenderCommitmentGroup/LenderCommitmentGroup_Smart.sol#L928-L935)
+The [delegation version](https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/MarketRegistry.sol#L332-L338) of the `revokeLender` function fails to perform any access control checks allowing any user to revoke any user
 
 ```solidity
-    function liquidateDefaultedLoanWithIncentive(
-        uint256 _bidId,
-        int256 _tokenAmountDifference
-    ) external whenForwarderNotPaused whenNotPaused bidIsActiveForGroup(_bidId) nonReentrant onlyOracleApprovedAllowEOA {
-        
-        //use original principal amount as amountDue
-
-        uint256 amountDue = _getAmountOwedForBid(_bidId);
-```
-
-```solidity
-    function _getAmountOwedForBid(uint256 _bidId )
-        internal
-        view
-        virtual
-        returns (uint256 amountDue)
-    {
-        // @audit this is the entire principal amount which is incorrect
-        (,,,, amountDue, , ,  )
-         = ITellerV2(TELLER_V2).getLoanSummary(_bidId);  
+    function _revokeStakeholderViaDelegation(
+        uint256 _marketId,
+        address _stakeholderAddress,
+        bool _isLender,
+        uint8 _v,
+        bytes32 _r,
+        bytes32 _s
+    ) internal {
+        bytes32 uuid = _revokeStakeholderVerification(
+            _marketId,
+            _stakeholderAddress,
+            _isLender
+        );
+        // NOTE: Disabling the call to revoke the attestation on EAS contracts
+        //        address attestor = markets[_marketId].owner;
+        //        tellerAS.revokeByDelegation(uuid, attestor, _v, _r, _s);
     }
 ```
 
-Parts of the original principal could have been repaid and accounted via this function leading to double counting of principal in `totalPrincipalTokensRepaid`
-```solidity
-    function repayLoanCallback(
-        uint256 _bidId,
-        address repayer,
-        uint256 principalAmount,
-        uint256 interestAmount
-    ) external onlyTellerV2 whenForwarderNotPaused whenNotPaused bidIsActiveForGroup(_bidId) { 
-        totalPrincipalTokensRepaid += principalAmount;
-        totalInterestCollected += interestAmount;
-```
-
-This leads to several problems:
-1. Underflow in `totalPrincipalTokensLended - totalPrincipalTokensRepaid` as `totalPrincipalTokensRepaid` can double count repaid tokens causing bids to revert  
-2. Lost assets due to `tokenDifferenceFromLiquidations` calculating difference from `totalPrincipal` without considering the repaid assets
-
 ### Internal pre-conditions
 
-_No response_
+Attestation should be enabled to observe the impact
 
 ### External pre-conditions
 
@@ -620,42 +545,11 @@ _No response_
 
 ### Attack Path
 
-1. A loan is created with principal amount == 100
-tokenBalanceOfContract == 0
-
-totalPrincipalTokensCommitted == 100
-totalPrincipalTokensWithdrawn == 0
-totalPrincipalTokensLended == 100
-totalPrincipalTokensRepaid == 0
-tokenDifferenceFromLiquidations == 0
-
-2. Repayment of 80 principal occurs before the loan gets defaulted
-tokenBalanceOfContract == 80
-
-totalPrincipalTokensCommitted == 100
-totalPrincipalTokensWithdrawn == 0
-totalPrincipalTokensLended == 100
-totalPrincipalTokensRepaid == 80
-tokenDifferenceFromLiquidations == 0
-
-3. Loan defaults and auction settles at price 50 (similarly problematic paths are lenders withdrawing 80 first or the auction settling at higher prices)
-tokenBalanceOfContract == 80 + 50 == 130
-
-totalPrincipalTokensCommitted == 100
-totalPrincipalTokensWithdrawn == 0
-totalPrincipalTokensLended == 100
-totalPrincipalTokensRepaid == 80 + 100 == 180 => incorrect
-tokenDifferenceFromLiquidations == (100 - 50 == -50) => incorrect
-
-Now: 
-- available amount to withdraw will be calculated as (totalPrincipalTokensCommitted + tokenDifferenceFromLiquidations == 50) while there is actually 130 amount of assets available to withdraw causing loss for lenders
-- getPrincipalAmountAvailableToBorrow will underflow because (totalPrincipalTokensLended - totalPrincipalTokensRepaid == -80) and no new bids can be accepted
-
-There are more scenarios that arise from the same root cause such as estimated value becoming 0 incorrectly, which will cause division by 0 and hence revert on withdrawals, deposits will be lost or 0 shares will be minted etc. 
+1. Attacker calls `revokeLender` by passing in any address they wish to revoke from the market
 
 ### Impact
 
-Lost assets for users, broken functionalities
+Attacker can revoke any address they wish from any market making the market unuseable
 
 ### PoC
 
@@ -663,7 +557,93 @@ _No response_
 
 ### Mitigation
 
-Instead of the totalPrincipal consider the remaining principal ie. `totalPrincipal - repaidPrincipal`
+Perform access control checks
+
+# Issue M-4: Not updating state before making custom external call can cause borrower's to loose assets due to re-entrancy 
+
+Source: https://github.com/sherlock-audit/2024-11-teller-finance-update-judging/issues/42 
+
+## Found by 
+hash
+### Summary
+
+Not updating state before making custom external call can cause borrower's to loose assets due to re-entrancy
+
+### Root Cause
+
+The details of the repayment is updated only after the external call to the `loanRepaymentListener` is made
+
+https://github.com/sherlock-audit/2024-11-teller-finance-update/blob/0c8535728f97d37a4052d2a25909d28db886a422/teller-protocol-v2-audit-2024/packages/contracts/contracts/TellerV2.sol#L865-L870
+```solidity
+    function _repayLoan(
+        uint256 _bidId,
+        Payment memory _payment,
+        uint256 _owedAmount,
+        bool _shouldWithdrawCollateral
+    ) internal virtual {
+        
+        ....
+        // @audit attacker can re-enter here. the repayment details are not yet updated
+        _sendOrEscrowFunds(_bidId, _payment); //send or escrow the funds
+
+        // update our mappings
+        bid.loanDetails.totalRepaid.principal += _payment.principal;
+        bid.loanDetails.totalRepaid.interest += _payment.interest;
+        bid.loanDetails.lastRepaidTimestamp = uint32(block.timestamp);
+```
+
+```solidity
+    function _sendOrEscrowFunds(uint256 _bidId, Payment memory _payment)
+        internal virtual 
+    {
+        
+        ....
+
+        address loanRepaymentListener = repaymentListenerForBid[_bidId];
+
+        // @audit re-enter in this call
+        if (loanRepaymentListener != address(0)) {
+            require(gasleft() >= 80000, "NR gas");  //fixes the 63/64 remaining issue
+            try
+                ILoanRepaymentListener(loanRepaymentListener).repayLoanCallback{
+                    gas: 80000
+                }( //limit gas costs to prevent lender preventing repayments
+                    _bidId,
+                    _msgSenderForMarket(bid.marketplaceId),
+                    _payment.principal,
+                    _payment.interest
+                )
+            {} catch {}
+```
+
+This allows a malicious lender to reenter the `TellerV2` contract and invoke `lenderCloseLoan` seizing the collateral of the borrower as well if the loan is currently defaulted
+
+### Internal pre-conditions
+
+1. The repayment should be made after defaultTimestamp has passed
+
+### External pre-conditions
+
+_No response_
+
+### Attack Path
+
+1. Defaulting timestmap of loan has passed
+2. Borrower does a repayment of 100 which is transferred to the lender. Following this `.repayLoanCallback` is called
+3. Lender reenters via the `loanRepaymentListener` and invokes the `lenderCloseLoan` function further seizing the collateral of the borrower
+4. Borrower looses both the repayment amount and the collateral
+
+### Impact
+
+Borrower will loose repayment amount and also the collateral
+
+### PoC
+
+_No response_
+
+### Mitigation
+
+Update the state before the `loanRepaymentListener` call is made
 
 # Issue M-5: Repayer can brick lending functionality of `LenderCommitmentGroup_Smart` by repaying excess 
 
